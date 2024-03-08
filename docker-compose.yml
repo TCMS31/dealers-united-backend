@@ -1,0 +1,93 @@
+# Local stack for the Time Capsule API.
+#
+# Host ports are in the 8620-8629 range so the stack never collides with a
+# database or web server already running on the machine.
+services:
+  app:
+    build:
+      context: .
+      target: app
+    image: time-capsule-api/app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_HOST: mysql
+      REDIS_HOST: redis
+      MAIL_HOST: mailpit
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - capsule
+
+  web:
+    build:
+      context: .
+      target: web
+    image: time-capsule-api/web
+    restart: unless-stopped
+    ports:
+      - '${APP_PORT:-8620}:80'
+    depends_on:
+      - app
+    networks:
+      - capsule
+
+  mysql:
+    image: 'mysql/mysql-server:8.0'
+    restart: unless-stopped
+    ports:
+      - '${FORWARD_DB_PORT:-8623}:3306'
+    environment:
+      MYSQL_ROOT_PASSWORD: '${DB_PASSWORD:-secret}'
+      MYSQL_ROOT_HOST: '%'
+      MYSQL_DATABASE: '${DB_DATABASE:-dealers_united}'
+      MYSQL_USER: '${DB_USERNAME:-dealers_united}'
+      MYSQL_PASSWORD: '${DB_PASSWORD:-secret}'
+    volumes:
+      - 'capsule-mysql:/var/lib/mysql'
+    networks:
+      - capsule
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', '127.0.0.1']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: 'redis:7-alpine'
+    restart: unless-stopped
+    ports:
+      - '${FORWARD_REDIS_PORT:-8624}:6379'
+    volumes:
+      - 'capsule-redis:/data'
+    networks:
+      - capsule
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mailpit:
+    image: 'axllent/mailpit:latest'
+    restart: unless-stopped
+    ports:
+      - '${FORWARD_MAILPIT_PORT:-8625}:1025'
+      - '${FORWARD_MAILPIT_DASHBOARD_PORT:-8626}:8025'
+    networks:
+      - capsule
+
+networks:
+  capsule:
+    driver: bridge
+
+volumes:
+  capsule-mysql:
+    driver: local
+  capsule-redis:
+    driver: local
