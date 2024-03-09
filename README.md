@@ -1,30 +1,32 @@
 # Time Capsule API
 
-A small Laravel API for digital time capsules. A signed-in user writes a note,
-picks an instant in the future, and the note is sealed: until that instant
-passes the API will only return a four-character teaser (`Tomo****`), and the
-capsule can only be opened afterwards. Masking and the unlock rule are enforced
-on the server, not in the client.
+A Laravel HTTP API for notes that cannot be read yet. You write a note, pick an
+instant in the future, and the API seals it: until that instant passes it hands
+back only a four-character teaser (`Tomo****`), and the capsule refuses to open.
+There is no interface here — the companion Vue client is `dealers-united-vue-app`.
 
-It is an HTTP API with no interface of its own. The companion Vue client lives
-in [`dealers-united-vue-app`](../dealers-united-vue-app).
+## The one rule everything else serves
 
-## Captured output
+A capsule is sealed until `scheduled_opening_time`, and *the server* decides that.
 
-Every request and response below was produced by `curl` against the API running
-locally; the full session is in [`docs/api-walkthrough.md`](docs/api-walkthrough.md)
-and the test, lint and route output is in [`docs/test-run.md`](docs/test-run.md).
+- Masking happens in `MessageCapsuleResource`, so every endpoint that returns a
+  capsule masks it — including `POST`, where a leak would be easiest to miss.
+- The boundary is inclusive: a capsule scheduled for exactly *now* is openable.
+- Masking keys off `is_opened`, not the clock, so a capsule that has unlocked but
+  which nobody opened is still masked in the listing.
+- Being early is a `403`, not a `401` — the caller is authenticated, just early.
+- The teaser counts characters rather than bytes, and a note no longer than the
+  preview is masked entirely rather than revealed whole.
 
-Sealing a capsule — the response is already masked:
+Named tests pin all five, among them `the_unlock_boundary_is_inclusive`,
+`an_unlocked_but_unopened_note_is_still_masked_in_the_listing`,
+`reading_a_still_sealed_capsule_is_forbidden_not_unauthenticated` and
+`it_counts_characters_not_bytes`.
 
-```http
-POST /api/v1/users/2/message-capsules
+## What it answers
 
-{
-  "note": "Tomorrow you will be proud of how patient you were.",
-  "scheduled_opening_time": "2026-10-25T04:32:58Z"
-}
-```
+Captured with `curl` against a locally served instance. `POST` a note and an
+instant, and the capsule comes back already sealed:
 
 ```http
 HTTP/1.1 201 Created
@@ -40,327 +42,209 @@ HTTP/1.1 201 Created
 }
 ```
 
-Trying to open it early:
+Reaching for it early is refused with
+`403 {"message": "Message capsule cannot be opened yet - time remaining."}`; once
+the instant has passed the same `PUT .../5/open` answers `200` with `note` in full
+and `is_opened` flipped to `true`. The full session — validation rejections, opt-in
+pagination, cross-account and anonymous cases, the reveal — is in
+[`docs/api-walkthrough.md`](docs/api-walkthrough.md).
 
-```http
-PUT /api/v1/users/2/message-capsules/5/open
-```
+## Endpoints
 
-```http
-HTTP/1.1 403 Forbidden
+Everything sits under `/api/v1`. Auth is a Sanctum bearer token issued by register
+and login — Fortify handles the credentials, `FortifyServiceProvider` swaps its
+redirect responses for JSON.
 
-{
-  "message": "Message capsule cannot be opened yet - time remaining."
-}
-```
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/register` | Create an account, returns `{ user, token }` |
+| `POST` | `/login` | Exchange credentials for `{ user, token }` |
+| `POST` | `/logout` | Revoke the session, `204 No Content` |
+| `GET` | `/user` | The signed-in account |
+| `GET` | `/users/{user}/message-capsules` | The user's capsules, sealed ones masked |
+| `POST` | `/users/{user}/message-capsules` | Seal a new capsule |
+| `GET` | `/users/{user}/message-capsules/{capsule}` | One capsule, once its instant has passed |
+| `PUT` | `/users/{user}/message-capsules/{capsule}/open` | Reveal a capsule, idempotent |
 
-Opening one whose instant has passed returns the note in full:
+Capsule routes are nested under `/users/{user}` and carry
+`EnsureRequestUserAuthenticated`, which refuses any attempt to address another
+account's collection before the controller or the policy is reached. Errors are
+always `{"message": "..."}`, with `errors` added on validation failures — `401`
+means the token is missing or invalid, `403` means authenticated but not allowed,
+which includes "too early". The listing returns the whole collection by default;
+`?per_page=` (or `?page=`) opts into a paginated response with `links` and `meta`
+capped by `CAPSULE_MAX_PER_PAGE`, opt-in so the existing client, which fetches
+everything and pages in the browser, keeps working.
 
-```http
-HTTP/1.1 200 OK
-
-{
-  "data": {
-    "id": 2,
-    "note": "Remember to call your sister on her birthday.",
-    "scheduled_opening_time": "2026-09-25T02:32:53.000000Z",
-    "is_opened": true,
-    "can_be_opened": false
-  }
-}
-```
-
-## Architecture
+## The data it keeps
 
 ```mermaid
-flowchart TB
-  Client["HTTP client<br/>(Vue SPA, curl)"]
+erDiagram
+    users ||--o{ message_capsules : seals
+    users ||--o{ personal_access_tokens : "authenticates with"
 
-  subgraph HTTP["HTTP layer"]
-    Throttle["api middleware group<br/>throttle:api, SubstituteBindings"]
-    Sanctum["auth:sanctum<br/>bearer token"]
-    Owner["EnsureRequestUserAuthenticated<br/>{user} must be the caller"]
-    Requests["Form requests<br/>Store / Index validation"]
-    Controller["MessageCapsuleController<br/>translates HTTP only"]
-    Resources["MessageCapsuleResource<br/>UserResource"]
-  end
+    users {
+        bigint id PK
+        string email UK
+        string password "bcrypt, hidden from every response"
+    }
 
-  subgraph Domain["Domain layer"]
-    Policy["MessageCapsulePolicy<br/>ownership + unlock time"]
-    Service["MessageCapsuleService<br/>list / create / open"]
-    Masker["NoteMasker<br/>PrefixNoteMasker"]
-  end
+    message_capsules {
+        bigint id PK
+        bigint user_id FK "indexed with the opening time"
+        text note "plaintext, masked at the edge"
+        datetime scheduled_opening_time "stored UTC, second precision"
+        boolean is_opened "false until revealed"
+    }
 
-  subgraph Data["Persistence"]
-    Model["MessageCapsule<br/>UtcDateTime cast"]
-    DB[("MySQL / SQLite")]
-  end
-
-  Auth["Fortify<br/>register, login, logout"]
-
-  Client -->|"Authorization: Bearer"| Throttle
-  Client -->|"credentials"| Auth
-  Auth -->|"issues Sanctum token"| Client
-  Throttle --> Sanctum --> Owner --> Requests --> Controller
-  Controller --> Policy
-  Controller --> Service
-  Controller --> Resources
-  Resources --> Masker
-  Service --> Model
-  Policy --> Model
-  Model --> DB
+    personal_access_tokens {
+        bigint id PK
+        string tokenable_type "polymorphic owner"
+        string token UK "hash, never the plaintext"
+    }
 ```
 
-Dependencies point inward. The controller knows about HTTP and calls the
-service; the service knows about capsules and calls the model; neither the
-service nor the policy can see a request or a response.
+Three columns carry the domain. `note` is plain text — the mask is presentation,
+not encryption. `scheduled_opening_time` is a `dateTime` at zero fractional
+precision, written as UTC by the `UtcDateTime` cast. `is_opened` is a capsule's
+only mutable field and only ever goes false to true. The listing filters on
+`user_id` and orders by `scheduled_opening_time`, so a composite index covers that
+pair (`message_capsules_user_schedule_index`) — a range read already in the right
+order rather than a scan plus filesort. That is an argument about the query plan,
+not a measurement: there is no benchmark here and the seeded dataset is far too
+small to produce a useful one.
 
-## Sealing and opening a capsule
+## Sealing, then opening
 
 ```mermaid
 sequenceDiagram
-  autonumber
   participant C as Client
   participant M as Ownership middleware
   participant Ctl as Controller
   participant P as Policy
   participant S as Service
-  participant R as Resource
 
-  C->>M: POST /users/{id}/message-capsules<br/>note + ISO-8601 instant
+  C->>M: POST /users/{id}/message-capsules
   M->>Ctl: {user} is the bearer-token holder
   Ctl->>P: create?
   P-->>Ctl: allow
   Ctl->>S: create(user, validated)
-  S-->>Ctl: capsule (instant stored as UTC)
-  Ctl->>R: MessageCapsuleResource
-  R-->>C: 201 { note: "Tomo****" }
+  S-->>Ctl: capsule, instant stored as UTC
+  Ctl-->>C: 201, note masked by MessageCapsuleResource
 
-  Note over C,R: time passes
+  Note over C,S: time passes
 
   C->>M: PUT /users/{id}/message-capsules/{id}/open
   M->>Ctl: same owner
   Ctl->>P: open?
-  alt opening time has not passed
-    P-->>C: 403 "cannot be opened yet"
-  else instant reached
+  alt the instant has not arrived
+    P-->>Ctl: deny
+    Ctl-->>C: 403 "cannot be opened yet"
+  else the instant has arrived
     P-->>Ctl: allow
     Ctl->>S: open(capsule)
-    S-->>Ctl: is_opened = true
-    Ctl->>R: MessageCapsuleResource
-    R-->>C: 200 { note: "<the full note>" }
+    S-->>Ctl: is_opened now true
+    Ctl-->>C: 200 with the full note
   end
 ```
 
-## Quickstart
+The controller does four things and no more: authorise, validate, call
+`MessageCapsuleService`, return a resource. The service never sees a request, so an
+Artisan command or a queued job can seal and open capsules the same way.
+`MessageCapsulePolicy` owns both halves of "may you touch this" — ownership, and
+whether the instant has passed — comparing foreign keys rather than loading the
+owner, so authorisation costs no extra query.
 
-The shortest path needs PHP 8.1+ and Composer, and no database server:
+## Run it
+
+PHP 8.1+ and Composer, no database server:
 
 ```bash
 composer install          # also writes .env from .env.example and sets APP_KEY
-
 touch database/database.sqlite
-sed -i '' 's#^DB_CONNECTION=.*#DB_CONNECTION=sqlite#' .env
+sed -i '' 's#^DB_CONNECTION=.*#DB_CONNECTION=sqlite#' .env      # GNU sed: drop the ''
 sed -i '' "s#^DB_DATABASE=.*#DB_DATABASE=$(pwd)/database/database.sqlite#" .env
-
 php artisan migrate --seed
 php artisan serve --port=8620
-```
 
-(On GNU sed, drop the `''` after `-i`.)
-
-```bash
-curl -s http://127.0.0.1:8620/
-# {"service":"Time Capsule API","status":"ok","api":"/api/v1"}
-
+curl -s http://127.0.0.1:8620/      # {"service":"...","status":"ok","api":"/api/v1"}
 curl -s -X POST http://127.0.0.1:8620/api/v1/login \
   -H 'Accept: application/json' -H 'Content-Type: application/json' \
   -d '{"email":"demo@example.com","password":"correct-horse-battery-staple"}'
-# {"user":{"id":1,...},"token":"1|..."}
 ```
 
-The seeder creates `demo@example.com` / `correct-horse-battery-staple` with
-four capsules: one already read, one unlocked and waiting, two still sealed.
+The seeder creates that demo account with four capsules (one already read, one
+unlocked and waiting, two sealed) and login answers `{ user, token }`.
 
-With Docker instead:
-
-```bash
-cp .env.example .env
-docker compose up -d --build
-docker compose exec app php artisan key:generate
-docker compose exec app php artisan migrate --seed
-# API on http://localhost:8620, Mailpit on http://localhost:8626
-```
-
-## API
-
-All paths are under `/api/v1`. Authentication is a Sanctum bearer token
-returned by register and login.
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/register` | Create an account; returns `{ user, token }` |
-| `POST` | `/login` | Exchange credentials for `{ user, token }` |
-| `POST` | `/logout` | Revoke the session; `204 No Content` |
-| `GET` | `/user` | The signed-in account |
-| `GET` | `/users/{user}/message-capsules` | The user's capsules, sealed ones masked |
-| `POST` | `/users/{user}/message-capsules` | Seal a new capsule |
-| `GET` | `/users/{user}/message-capsules/{capsule}` | One capsule, once its instant has passed |
-| `PUT` | `/users/{user}/message-capsules/{capsule}/open` | Reveal a capsule; idempotent |
-
-`scheduled_opening_time` is an ISO-8601 instant. Send one with an explicit
-offset (`2026-10-25T04:26:15Z` or `+01:00`); a value with no offset is read as
-`APP_TIMEZONE`. Responses always carry UTC (`…Z`).
-
-Errors are always `{"message": "..."}`, with `errors` added for validation
-failures. `401` means the token is missing or invalid; `403` means the caller
-is authenticated but not allowed — including "too early".
-
-## Configuration
-
-| Variable | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `APP_KEY` | yes | — | Laravel encryption key; `php artisan key:generate` |
-| `APP_NAME` | no | `Time Capsule API` | Name returned by the health route |
-| `APP_ENV` | no | `production` | `local` enables developer tooling |
-| `APP_DEBUG` | no | `false` | Never `true` in a deployed environment |
-| `APP_URL` | no | `http://localhost` | Base URL used in pagination links |
-| `APP_TIMEZONE` | no | `UTC` | Server timezone. Changing it changes the instant a capsule unlocks |
-| `DB_CONNECTION` | no | `mysql` | `sqlite` needs no server |
-| `DB_HOST` | no | `127.0.0.1` | `mysql` inside the compose network |
-| `DB_PORT` | no | `3306` | |
-| `DB_DATABASE` | no | `forge` | Database name, or an absolute path for SQLite |
-| `DB_USERNAME` | no | `forge` | |
-| `DB_PASSWORD` | no | empty | |
-| `CORS_ALLOWED_ORIGINS` | no | `*` | Comma-separated client origins. Set a real list outside development |
-| `CORS_MAX_AGE` | no | `0` | Preflight cache seconds |
-| `SANCTUM_STATEFUL_DOMAINS` | no | localhost set | Hosts allowed to use a session cookie instead of a token |
-| `CAPSULE_PREVIEW_LENGTH` | no | `4` | Characters kept before the asterisks |
-| `CAPSULE_MAX_NOTE_LENGTH` | no | `5000` | Upper bound on a stored note |
-| `CAPSULE_DEFAULT_PER_PAGE` | no | `15` | Page size when `?page=` is given without `?per_page=` |
-| `CAPSULE_MAX_PER_PAGE` | no | `100` | Largest page a caller may request |
-| `APP_PORT` | no | `8620` | Host port published by compose |
-| `FORWARD_DB_PORT` | no | `8623` | Host port for MySQL |
-| `FORWARD_REDIS_PORT` | no | `8624` | Host port for Redis |
-| `FORWARD_MAILPIT_PORT` | no | `8625` | Host SMTP port |
-| `FORWARD_MAILPIT_DASHBOARD_PORT` | no | `8626` | Mailpit web UI |
-
-## Development
+`docker compose up -d --build` brings up app, nginx, MySQL, Redis and Mailpit on
+host ports 8620–8626, then `key:generate` and `migrate --seed` inside `app`. That
+compose file parses cleanly under `docker compose config`, but the images have not
+been built or booted here — the nginx↔php-fpm wiring is unexercised.
 
 ```bash
-composer test          # PHPUnit, in-memory SQLite, no services needed
-composer lint          # Pint (Laravel preset), fixes in place
-composer lint:check    # Pint in check mode, for CI
+composer test          # PHPUnit against in-memory SQLite, nothing external needed
+composer lint:check    # Pint in check mode, for CI (composer lint fixes in place)
 php artisan route:list --except-vendor
 ```
 
-The suite runs entirely against an in-memory SQLite database configured in
-`phpunit.xml`; nothing external has to be running.
+`phpunit.xml` pins `DB_CONNECTION=sqlite`, `DB_DATABASE=:memory:` and
+`APP_TIMEZONE=UTC`, so the 44 tests need no infrastructure. Suite, lint and route
+output are captured in [`docs/test-run.md`](docs/test-run.md).
 
-## Project structure
+## Timestamps are instants, not wall-clock readings
 
-```
-app/
-  Casts/UtcDateTime.php            store and read timestamps as UTC instants
-  Exceptions/Handler.php           one JSON error shape, correct status codes
-  Http/
-    Controllers/                   HTTP translation only
-    Middleware/
-      EnsureRequestUserAuthenticated.php   {user} must be the caller
-    Requests/                      Index/Store validation contracts
-    Resources/                     the public shape of a capsule and a user
-  Models/MessageCapsule.php        the unlock rule
-  Policies/MessageCapsulePolicy.php  ownership + "is it time yet"
-  Services/MessageCapsuleService.php list / create / open
-  Support/Masking/                 NoteMasker seam + default implementation
-  Providers/                       container bindings, routing, Fortify JSON
-config/capsules.php                masking, note size and pagination knobs
-database/
-  factories/                       sealed / unlocked / opened states
-  migrations/                      table, plus the (user_id, time) index
-  seeders/                         a demo account with all three states
-docker/                            nginx vhost, php.ini, entrypoint
-docs/                              captured request/response and terminal output
-routes/api.php                     the versioned API surface
-tests/Feature|Unit                 44 tests
-```
+`APP_TIMEZONE` defaults to `UTC`, and `scheduled_opening_time` is cast through
+`App\Casts\UtcDateTime` rather than Eloquent's built-in `datetime`. The built-in
+tries `Carbon::createFromFormat('Y-m-d H:i:s', …)` first, and PHP treats the
+trailing `+01:00` of an ISO-8601 string as *trailing data* — a warning, not an
+error — so the offset is dropped, the wall clock kept, and a Berlin client's
+capsule unlocks an hour late. `Carbon::parse` honours the offset, so the cast uses
+it, stores UTC and reads back as UTC explicitly. Tested by
+`an_offset_timestamp_is_normalised_to_utc` and
+`an_offset_carrying_timestamp_is_understood_as_an_absolute_instant`.
 
-## Design notes
+Send an explicit offset (`2026-10-25T04:26:15Z` or `+01:00`); a value without one
+is read as `APP_TIMEZONE`. Responses always carry UTC (`…Z`).
 
-**Layering.** The controller does four things: authorise, validate, call the
-service, return a resource. Everything a capsule *is* lives in the model and
-the service, so an Artisan command or a queued job can seal and open capsules
-without constructing a request. The policy owns both halves of "may you touch
-this": ownership, and whether the instant has passed.
+## Configuration
 
-**Timestamps are instants, not wall-clock readings.** This is where the
-original had a real defect. `config/app.php` hardcoded `America/New_York`, the
-column had no cast, and the value was written to and read from the database as
-a naive string. A client sending `12:00` and a server reading `12:00` agreed on
-the characters and disagreed on the moment by four or five hours. Two changes
-fix it: `APP_TIMEZONE` defaults to UTC, and `scheduled_opening_time` uses the
-`UtcDateTime` cast. The cast is deliberately not Eloquent's built-in `datetime`
-— that one tries `createFromFormat('Y-m-d H:i:s', …)` first, which treats the
-`+01:00` of an ISO-8601 string as trailing data and silently discards it.
-`Carbon::parse` honours the offset. There is a test for exactly that case.
+[`.env.example`](.env.example) is the full commented list, and `APP_KEY` — the one
+variable with no usable default — is generated by `composer install`. The knobs
+that belong to this application rather than to Laravel:
 
-**Masking is a server concern.** The resource masks; the client is never
-trusted to. `store` used to return the raw Eloquent model — the full note in
-clear, plus `user_id` and the timestamps — and the Vue client had to re-mask
-it locally. Every endpoint now goes through `MessageCapsuleResource`. The
-default rule keeps four characters, counted as characters rather than bytes,
-and masks a note of four characters or fewer entirely rather than revealing it
-whole.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `APP_TIMEZONE` | `UTC` | Changing it changes the instant every capsule unlocks |
+| `CAPSULE_PREVIEW_LENGTH` | `4` | Characters kept before the asterisks — `0` masks everything |
+| `CAPSULE_MAX_NOTE_LENGTH` | `5000` | Bound on a stored note. The column is `TEXT`, so without it one request can push 64 KB |
+| `CAPSULE_DEFAULT_PER_PAGE` | `15` | Page size when `?page=` is given without `?per_page=` |
+| `CAPSULE_MAX_PER_PAGE` | `100` | Largest page a caller may request |
+| `CORS_ALLOWED_ORIGINS` | `*` | Comma-separated client origins. Set a real list outside development |
 
-**Status codes are part of the contract.** Authorisation failures used to
-render as `401`. An HTTP client cannot tell that apart from an expired token,
-so clicking "open" an hour early logged the user out. They are `403` now, and
-`AuthorizationException` messages reach the client under `message` rather than
-a custom `status_message` key nobody parsed.
+`config/capsules.php` reads those and binds `NoteMasker`, so "mask everything",
+"show a word count" or "show the first line" is a new class plus a config line.
 
-**Scalability.** The bottleneck is the listing. It filtered on `user_id` and
-ordered by `scheduled_opening_time` with neither column indexed, and returned
-every row a user had ever written. The composite index
-`(user_id, scheduled_opening_time)` turns the scan plus filesort into an
-ordered range read, and pagination is available via `?per_page=`, capped by
-`CAPSULE_MAX_PER_PAGE`. Pagination is opt-in rather than default so the
-existing client, which expects the whole collection under `data`, keeps
-working. The policy also stopped lazy-loading the owning `User` on every
-authorisation check — comparing `user_id` to the authenticated key is the same
-answer with one fewer query per request.
+## Notes for the Vue client
 
-**Extensibility.** The one seam worth building is how a sealed note is
-rendered. `NoteMasker` is a one-method interface resolved from the container
-and named in `config/capsules.php`, so "mask everything", "show a word count"
-or "show the first line" is a new class and a config line, with nothing in the
-resource or the controller to touch.
+Two things to know if you read `dealers-united-vue-app` alongside this. `POST`
+returns a `MessageCapsuleResource`, so the created capsule arrives wrapped in
+`data` and already masked — that client's `listCapsules` and `openCapsule` unwrap
+`data`, its `createCapsule` does not, and its store re-masks the note locally,
+which this shape makes redundant. And its `src/lib/datetime.js` expects a naive
+timestamp and assumes UTC, where this API sends ISO-8601 with an explicit `Z`;
+that parser handles both forms, so the two agree on the instant, but the comment
+describes an older shape.
 
-**Rate limiting.** `RateLimiter::for('api', …)` was defined in
-`RouteServiceProvider` but never applied, because `routes/api.php` was loaded
-into the `web` middleware group. The API now loads into the `api` group, which
-is where `throttle:api` lives, and CSRF protection — which had been commented
-out of the `web` group entirely — is back on for the cookie-authenticated
-routes that remain.
+## What this does not do
 
-## Limitations
-
-- **No edit or delete.** A capsule can be sealed, listed and opened; that is
-  the whole model. There is no `PATCH` and no `DELETE`.
-- **Opening is one-way and unaudited.** Nothing records *when* a capsule was
-  opened, only that it was.
-- **Notes are stored in plain text.** The mask is a presentation rule, not
-  encryption: anyone with database access can read every sealed note. Real
-  secrecy would mean encrypting the note with a key released at the opening
-  time, which is a different and much larger problem.
-- **A short note reveals more of itself proportionally.** A five-character note
-  shows four of its five characters. The four-character teaser comes from the
-  brief; `CAPSULE_PREVIEW_LENGTH=0` masks everything if that trade is wrong for
-  you.
-- **No scheduled notification.** Nothing tells a user that a capsule has
-  unlocked; the client polls. Mailpit and Redis are wired into the compose
-  stack but the application queues nothing.
-- **Password reset is routed but has no delivery.** Fortify's reset endpoints
-  are enabled and send mail through whatever `MAIL_MAILER` is configured; in
-  development that is Mailpit, and nothing else is set up.
-- **The Docker images have not been built.** `docker compose config` parses
-  cleanly, but the stack has not been brought up in this environment.
+- **No edit, no delete, no audit.** Seal, list, open is the whole model, and
+  nothing records *when* a capsule was opened, only that it was.
+- **Notes are plaintext in the database.** Anyone with database access reads every
+  sealed note; real secrecy needs a key released at the opening time, a far larger
+  project.
+- **A short note reveals more of itself proportionally** — a five-character note
+  shows four of its five, unless you set `CAPSULE_PREVIEW_LENGTH=0`.
+- **Nothing announces an unlock.** The client polls. Redis and Mailpit are in the
+  compose stack, but the application queues nothing.
+- **Password reset is routed but undelivered.** Fortify's reset endpoints mail
+  through whatever `MAIL_MAILER` is set to — Mailpit in development, nothing else.
